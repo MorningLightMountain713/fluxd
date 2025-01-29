@@ -1828,7 +1828,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
             return InitError(_("-mineraddress is not in the local wallet. Either use a local address, or set -minetolocalwallet=0"));
         }
  #endif // ENABLE_WALLET
- 
+
         // This is leveraging the fact that boost::signals2 executes connected
         // handlers in-order. Further up, the wallet is connected to this signal
         // if the wallet is enabled. The wallet's ScriptForMining handler does
@@ -1885,6 +1885,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 
     fFluxnode = GetBoolArg("-zelnode", false);
+    fArcane = getenv("FLUXOS_VERSION") != NULL;
 
     if ((fFluxnode || fluxnodeConfig.getCount() > -1) && fTxIndex == false) {
         return InitError("Enabling Fluxnode support requires turning on transaction indexing."
@@ -1953,10 +1954,10 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 
     if (fFluxnode) {
-        
+
         strPath = GetSelfPath();
         LogPrintf("Path: %s\n",strPath);
-       
+
          if (FindBenchmarkPath("fluxbenchd",strPath)) {
 
             LogPrintf("Found fluxbenchd in %s\n",strPath);
@@ -1981,10 +1982,10 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                  return InitError("Failed to find benchmark cli application");
              }
         }
-        
+
     }
 
-    if (fFluxnode) {
+    if (fFluxnode && !fArcane) {
         // Check if the benchmark application is running
         if (!IsFluxBenchdRunning()) {
             StartFluxBenchd();

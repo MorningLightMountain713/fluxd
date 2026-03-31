@@ -16,7 +16,7 @@ CacheDirectory=flux-zmq-monitor
 CacheDirectoryMode=0755
 
 # Run with uv
-ExecStart=/usr/local/bin/uv run --frozen flux-zmq-monitor --log-file /var/log/flux-zmq-monitor/events.log
+ExecStart=/usr/local/bin/uv run --frozen --no-sync --no-editable flux-zmq-monitor --log-file /var/log/flux-zmq-monitor/events.log
 
 # Logging
 StandardOutput=journal

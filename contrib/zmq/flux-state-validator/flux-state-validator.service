@@ -17,9 +17,9 @@ CacheDirectoryMode=0755
 
 # Run the validator
 # Adjust RPC config path as needed for your installation
-ExecStart=/usr/local/bin/uv run --frozen flux-state-validator \
+ExecStart=/usr/local/bin/uv run --frozen --no-sync --no-editable flux-state-validator \
     --zmq tcp://127.0.0.1:16123 \
-    --rpc-conf /var/lib/fluxd/flux.conf \
+    --rpc-conf /dat/var/lib/fluxd/flux.conf \
     --log /var/log/flux-state-validator/validation.log \
     --interval 10
 

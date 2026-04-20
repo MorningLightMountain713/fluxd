@@ -3342,7 +3342,7 @@ static DisconnectResult DisconnectBlock(const CBlock& block, CValidationState& s
     // the Sapling activation height. Otherwise, the last anchor was the
     // empty root.
     if (NetworkUpgradeActive(pindex->pprev->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_ACADIA)) {
-        view.PopAnchor(pindex->pprev->hashFinalSaplingRoot, SAPLING);
+        view.PopAnchor(pindex->pprev->pHeaderData->hashFinalSaplingRoot, SAPLING);
     } else {
         view.PopAnchor(SaplingMerkleTree::empty_root(), SAPLING);
     }
@@ -3540,9 +3540,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             view.SetBestBlock(pindex->GetBlockHash());
             // Before the genesis block, there was an empty tree
             SproutMerkleTree tree;
-            pindex->hashSproutAnchor = tree.root();
+            pindex->pHeaderData->hashSproutAnchor = tree.root();
             // The genesis block contained no JoinSplits
-            pindex->hashFinalSproutRoot = pindex->hashSproutAnchor;
+            pindex->pHeaderData->hashFinalSproutRoot = pindex->pHeaderData->hashSproutAnchor;
         }
         return true;
     }
@@ -3554,8 +3554,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // We can expect nChainSproutValue to be valid after the hardcoded
         // height, and this will be enforced on all descendant blocks. If
         // the node was reindexed then this will be enforced for all blocks.
-        if (pindex->nChainSproutValue) {
-            if (*pindex->nChainSproutValue < 0) {
+        if (pindex->pHeaderData->nChainSproutValue) {
+            if (*pindex->pHeaderData->nChainSproutValue < 0) {
                 return state.DoS(100, error("ConnectBlock(): turnstile violation in Sprout shielded value pool"),
                              REJECT_INVALID, "turnstile-violation-sprout-shielded-pool");
             }
@@ -3568,8 +3568,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // However, the miner and mining RPCs may not have populated this
         // value and will call `TestBlockValidity`. So, we act
         // conditionally.
-        if (pindex->nChainSaplingValue) {
-            if (*pindex->nChainSaplingValue < 0) {
+        if (pindex->pHeaderData->nChainSaplingValue) {
+            if (*pindex->pHeaderData->nChainSaplingValue < 0) {
                 return state.DoS(100, error("ConnectBlock(): turnstile violation in Sapling shielded value pool"),
                              REJECT_INVALID, "turnstile-violation-sapling-shielded-pool");
             }
@@ -3624,7 +3624,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     auto old_sprout_tree_root = view.GetBestAnchor(SPROUT);
     // saving the top anchor in the block index as we go.
     if (!fJustCheck) {
-        pindex->hashSproutAnchor = old_sprout_tree_root;
+        pindex->pHeaderData->hashSproutAnchor = old_sprout_tree_root;
     }
     SproutMerkleTree sprout_tree;
     // This should never fail: we should always be able to get the root
@@ -3842,7 +3842,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     view.PushAnchor(sprout_tree);
     view.PushAnchor(sapling_tree);
     if (!fJustCheck) {
-        pindex->hashFinalSproutRoot = sprout_tree.root();
+        pindex->pHeaderData->hashFinalSproutRoot = sprout_tree.root();
     }
     blockundo.old_sprout_tree_root = old_sprout_tree_root;
 
@@ -3898,9 +3898,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             "nCachedBranchId must be set after all consensus rules have been validated.");
         if (IsActivationHeightForAnyUpgrade(pindex->nHeight, chainparams.GetConsensus())) {
             pindex->nStatus |= BLOCK_ACTIVATES_UPGRADE;
-            pindex->nCachedBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+            pindex->pHeaderData->nCachedBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
         } else if (pindex->pprev) {
-            pindex->nCachedBranchId = pindex->pprev->nCachedBranchId;
+            pindex->pHeaderData->nCachedBranchId = pindex->pprev->pHeaderData ? pindex->pprev->pHeaderData->nCachedBranchId : boost::none;
         }
 
         pindex->RaiseValidity(BLOCK_VALID_SCRIPTS);
@@ -4732,17 +4732,17 @@ void FallbackSproutValuePoolBalance(
     if (pindex->nHeight == chainparams.SproutValuePoolCheckpointHeight()) {
         if (pindex->GetBlockHash() == chainparams.SproutValuePoolCheckpointBlockHash()) {
             // Are we monitoring the Sprout pool?
-            if (!pindex->nChainSproutValue) {
+            if (!pindex->pHeaderData->nChainSproutValue) {
                 // Apparently not. Introduce the hardcoded value so we monitor for
                 // this point onwards (assuming the checkpoint is late enough)
-                pindex->nChainSproutValue = chainparams.SproutValuePoolCheckpointBalance();
+                pindex->pHeaderData->nChainSproutValue = chainparams.SproutValuePoolCheckpointBalance();
             } else {
                 // Apparently we have been. So, we should expect the current
                 // value to match the hardcoded one.
-                assert(*pindex->nChainSproutValue == chainparams.SproutValuePoolCheckpointBalance());
+                assert(*pindex->pHeaderData->nChainSproutValue == chainparams.SproutValuePoolCheckpointBalance());
                 // And we should expect non-none for the delta stored in the block index here,
                 // or the checkpoint is too early.
-                assert(pindex->nSproutValue != boost::none);
+                assert(pindex->pHeaderData->nSproutValue != boost::none);
             }
         } else {
             LogPrintf(
@@ -4777,10 +4777,10 @@ bool ReceivedBlockTransactions(
             sproutValue -= js.vpub_new;
         }
     }
-    pindexNew->nSproutValue = sproutValue;
-    pindexNew->nChainSproutValue = boost::none;
-    pindexNew->nSaplingValue = saplingValue;
-    pindexNew->nChainSaplingValue = boost::none;
+    pindexNew->pHeaderData->nSproutValue = sproutValue;
+    pindexNew->pHeaderData->nChainSproutValue = boost::none;
+    pindexNew->pHeaderData->nSaplingValue = saplingValue;
+    pindexNew->pHeaderData->nChainSaplingValue = boost::none;
     pindexNew->nFile = pos.nFile;
     pindexNew->nDataPos = pos.nPos;
     pindexNew->nUndoPos = 0;
@@ -4799,19 +4799,19 @@ bool ReceivedBlockTransactions(
             queue.pop_front();
             pindex->nChainTx = (pindex->pprev ? pindex->pprev->nChainTx : 0) + pindex->nTx;
             if (pindex->pprev) {
-                if (pindex->pprev->nChainSproutValue && pindex->nSproutValue) {
-                    pindex->nChainSproutValue = *pindex->pprev->nChainSproutValue + *pindex->nSproutValue;
+                if (pindex->pprev->pHeaderData && pindex->pprev->pHeaderData->nChainSproutValue && pindex->pHeaderData->nSproutValue) {
+                    pindex->pHeaderData->nChainSproutValue = *pindex->pprev->pHeaderData->nChainSproutValue + *pindex->pHeaderData->nSproutValue;
                 } else {
-                    pindex->nChainSproutValue = boost::none;
+                    pindex->pHeaderData->nChainSproutValue = boost::none;
                 }
-                if (pindex->pprev->nChainSaplingValue) {
-                    pindex->nChainSaplingValue = *pindex->pprev->nChainSaplingValue + pindex->nSaplingValue;
+                if (pindex->pprev->pHeaderData && pindex->pprev->pHeaderData->nChainSaplingValue) {
+                    pindex->pHeaderData->nChainSaplingValue = *pindex->pprev->pHeaderData->nChainSaplingValue + pindex->pHeaderData->nSaplingValue;
                 } else {
-                    pindex->nChainSaplingValue = boost::none;
+                    pindex->pHeaderData->nChainSaplingValue = boost::none;
                 }
             } else {
-                pindex->nChainSproutValue = pindex->nSproutValue;
-                pindex->nChainSaplingValue = pindex->nSaplingValue;
+                pindex->pHeaderData->nChainSproutValue = pindex->pHeaderData->nSproutValue;
+                pindex->pHeaderData->nChainSaplingValue = pindex->pHeaderData->nSaplingValue;
             }
 
             // Fall back to hardcoded Sprout value pool balance
@@ -5684,26 +5684,28 @@ bool static LoadBlockIndexDB()
             if (pindex->pprev) {
                 if (pindex->pprev->nChainTx) {
                     pindex->nChainTx = pindex->pprev->nChainTx + pindex->nTx;
-                    if (pindex->pprev->nChainSproutValue && pindex->nSproutValue) {
-                        pindex->nChainSproutValue = *pindex->pprev->nChainSproutValue + *pindex->nSproutValue;
+                    if (pindex->pprev->pHeaderData && pindex->pprev->pHeaderData->nChainSproutValue && pindex->pHeaderData && pindex->pHeaderData->nSproutValue) {
+                        pindex->pHeaderData->nChainSproutValue = *pindex->pprev->pHeaderData->nChainSproutValue + *pindex->pHeaderData->nSproutValue;
                     } else {
-                        pindex->nChainSproutValue = boost::none;
+                        if (pindex->pHeaderData) pindex->pHeaderData->nChainSproutValue = boost::none;
                     }
-                    if (pindex->pprev->nChainSaplingValue) {
-                        pindex->nChainSaplingValue = *pindex->pprev->nChainSaplingValue + pindex->nSaplingValue;
+                    if (pindex->pprev->pHeaderData && pindex->pprev->pHeaderData->nChainSaplingValue) {
+                        pindex->pHeaderData->nChainSaplingValue = *pindex->pprev->pHeaderData->nChainSaplingValue + (pindex->pHeaderData ? pindex->pHeaderData->nSaplingValue : 0);
                     } else {
-                        pindex->nChainSaplingValue = boost::none;
+                        if (pindex->pHeaderData) pindex->pHeaderData->nChainSaplingValue = boost::none;
                     }
                 } else {
                     pindex->nChainTx = 0;
-                    pindex->nChainSproutValue = boost::none;
-                    pindex->nChainSaplingValue = boost::none;
+                    if (pindex->pHeaderData) pindex->pHeaderData->nChainSproutValue = boost::none;
+                    if (pindex->pHeaderData) pindex->pHeaderData->nChainSaplingValue = boost::none;
                     mapBlocksUnlinked.insert(std::make_pair(pindex->pprev, pindex));
                 }
             } else {
                 pindex->nChainTx = pindex->nTx;
-                pindex->nChainSproutValue = pindex->nSproutValue;
-                pindex->nChainSaplingValue = pindex->nSaplingValue;
+                if (pindex->pHeaderData) {
+                    pindex->pHeaderData->nChainSproutValue = pindex->pHeaderData->nSproutValue;
+                    pindex->pHeaderData->nChainSaplingValue = pindex->pHeaderData->nSaplingValue;
+                }
             }
 
             // Fall back to hardcoded Sprout value pool balance
@@ -5713,8 +5715,10 @@ bool static LoadBlockIndexDB()
             // override and set the in-memory size of shielded pools to zero.  An unshielding transaction
             // can then be used to trigger and test the handling of turnstile violations.
             if (fExperimentalMode && mapArgs.count("-developersetpoolsizezero")) {
-                pindex->nChainSproutValue = 0;
-                pindex->nChainSaplingValue = 0;
+                if (pindex->pHeaderData) {
+                    pindex->pHeaderData->nChainSproutValue = 0;
+                    pindex->pHeaderData->nChainSaplingValue = 0;
+                }
             }
         }
         // Construct in-memory chain of branch IDs.
@@ -5724,11 +5728,11 @@ bool static LoadBlockIndexDB()
         // validity status because it is side-loaded into a fresh chain.
         // Activation blocks will have branch IDs set (read from disk).
         if (pindex->pprev) {
-            if (pindex->IsValid(BLOCK_VALID_CONSENSUS) && !pindex->nCachedBranchId) {
-                pindex->nCachedBranchId = pindex->pprev->nCachedBranchId;
+            if (pindex->IsValid(BLOCK_VALID_CONSENSUS) && pindex->pHeaderData && !pindex->pHeaderData->nCachedBranchId) {
+                pindex->pHeaderData->nCachedBranchId = (pindex->pprev->pHeaderData ? pindex->pprev->pHeaderData->nCachedBranchId : boost::optional<uint32_t>(SPROUT_BRANCH_ID));
             }
         } else {
-            pindex->nCachedBranchId = SPROUT_BRANCH_ID;
+            if (pindex->pHeaderData) pindex->pHeaderData->nCachedBranchId = SPROUT_BRANCH_ID;
         }
         if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && (pindex->nChainTx || pindex->pprev == NULL))
             setBlockIndexCandidates.insert(pindex);
@@ -5807,7 +5811,9 @@ bool static LoadBlockIndexDB()
         // - This will miss chain tips; we handle the best tip below, and other
         //   tips will be handled by ConnectTip during a re-org.
         if (pindex->pprev) {
-            pindex->pprev->hashFinalSproutRoot = pindex->hashSproutAnchor;
+            if (pindex->pprev->pHeaderData && pindex->pHeaderData) {
+                pindex->pprev->pHeaderData->hashFinalSproutRoot = pindex->pHeaderData->hashSproutAnchor;
+            }
         }
     }
 
@@ -5817,7 +5823,8 @@ bool static LoadBlockIndexDB()
         return true;
     chainActive.SetTip(it->second);
     // Set hashFinalSproutRoot for the end of best chain
-    it->second->hashFinalSproutRoot = pcoinsTip->GetBestAnchor(SPROUT);
+    if (it->second->pHeaderData)
+        it->second->pHeaderData->hashFinalSproutRoot = pcoinsTip->GetBestAnchor(SPROUT);
 
     PruneBlockIndexCandidates();
 
@@ -5944,8 +5951,9 @@ bool RewindBlockIndex(const CChainParams& chainparams, bool& clearWitnessCaches)
         bool fFlagSet = pindex->nStatus & BLOCK_ACTIVATES_UPGRADE;
         bool fFlagExpected = IsActivationHeightForAnyUpgrade(pindex->nHeight, consensus);
         return fFlagSet == fFlagExpected &&
-            pindex->nCachedBranchId &&
-            *pindex->nCachedBranchId == CurrentEpochBranchId(pindex->nHeight, consensus);
+            pindex->pHeaderData &&
+            pindex->pHeaderData->nCachedBranchId &&
+            *pindex->pHeaderData->nCachedBranchId == CurrentEpochBranchId(pindex->nHeight, consensus);
     };
 
     int nHeight = 1;

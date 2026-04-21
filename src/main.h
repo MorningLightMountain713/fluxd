@@ -142,7 +142,6 @@ extern CCriticalSection cs_main;
 extern CTxMemPool mempool;
 typedef boost::unordered_map<uint256, CBlockIndex*, BlockHasher> BlockMap;
 extern BlockMap mapBlockIndex;
-extern uint256 hashLastBlockIndexWrite;
 
 class CBlockIndexPool;
 extern CBlockIndexPool* g_blockIndexPool;

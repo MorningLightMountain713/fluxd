@@ -35,7 +35,10 @@ rust_crates := \
 rust_packages := rust $(rust_crates) librustzcash
 proton_packages := proton
 zcash_packages := libsodium
-packages := boost openssl libevent zeromq $(zcash_packages) googletest
+ifeq ($(host_os),linux)
+jemalloc_packages := jemalloc
+endif
+packages := boost openssl libevent zeromq $(zcash_packages) $(jemalloc_packages) googletest
 native_packages := native_ccache
 
 wallet_packages=bdb

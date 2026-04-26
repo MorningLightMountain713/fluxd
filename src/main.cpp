@@ -7393,6 +7393,93 @@ void static ProcessAttestationTx(CNode* pfrom, const CTransaction& tx, const CIn
     TryPromoteStagedTx(inv.hash, vTxToRelay);
 }
 
+/**
+ * Validate an incoming attestation: verify the attester is a confirmed
+ * fluxnode and the signature is valid. Returns the attester's cache data
+ * on success, or a null entry on failure. Handles Misbehaving.
+ *
+ * Caller must hold cs_main.
+ */
+enum AttestationValidationResult { ATT_VALID, ATT_INVALID_ATTESTER, ATT_BAD_SIGNATURE };
+
+AttestationValidationResult static ValidateAttestation(CNode* pfrom,
+                                                       const CFluxnodeAttestation& att,
+                                                       FluxnodeCacheData& attesterDataOut)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    {
+        LOCK(g_fluxnodeCache.cs);
+        auto it = g_fluxnodeCache.mapConfirmedFluxnodeData.find(att.attesterOutpoint);
+        if (it != g_fluxnodeCache.mapConfirmedFluxnodeData.end())
+            attesterDataOut = it->second;
+    }
+    if (attesterDataOut.IsNull()) {
+        LogPrint("attestation", "fluxattest: attester %s not a confirmed fluxnode\n",
+                 att.attesterOutpoint.ToString());
+        return ATT_INVALID_ATTESTER;
+    }
+
+    std::string strMessage = att.txid.GetHex() + att.attesterOutpoint.ToString();
+    std::string errorMessage;
+    if (!obfuScationSigner.VerifyMessage(attesterDataOut.pubKey, att.vchSig, strMessage, errorMessage)) {
+        LogPrint("attestation", "fluxattest: invalid signature from %s: %s\n",
+                 att.attesterOutpoint.ToString(), errorMessage);
+        std::string attesterHost;
+        int attesterPort;
+        SplitHostPort(attesterDataOut.ip, attesterPort, attesterHost);
+        if (pfrom->addr.ToStringIP() == attesterHost)
+            Misbehaving(pfrom->GetId(), 10);
+        return ATT_BAD_SIGNATURE;
+    }
+
+    return ATT_VALID;
+}
+
+/**
+ * Accept a validated attestation: check rate limits, dedup, add to staging,
+ * and try to promote. Returns true if accepted.
+ *
+ * Caller must hold cs_main.
+ */
+bool static AcceptAttestation(CNode* pfrom, const CFluxnodeAttestation& att,
+                              const uint256& attHash, int nCurrentHeight,
+                              std::vector<CTransaction>& vTxToRelay)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    LOCK(g_attestationManager.cs);
+
+    if (!g_attestationManager.CheckPeerInvLimit(pfrom->GetId())) {
+        Misbehaving(pfrom->GetId(), 5);
+        LogPrint("attestation", "fluxattest: peer=%d exceeded attestation rate limit\n", pfrom->id);
+        return false;
+    }
+
+    if (g_attestationManager.HasSeenAttestation(attHash))
+        return false;
+
+    if (g_attestationManager.IsAttesterBanned(att.attesterOutpoint)) {
+        LogPrint("attestation", "fluxattest: attester %s is banned\n",
+                 att.attesterOutpoint.ToString());
+        return false;
+    }
+
+    if (!g_attestationManager.CheckAttesterRateLimit(att.attesterOutpoint, nCurrentHeight)) {
+        LogPrint("attestation", "fluxattest: attester %s exceeded rate limit\n",
+                 att.attesterOutpoint.ToString());
+        return false;
+    }
+
+    g_attestationManager.MarkAttestationSeen(attHash);
+    g_attestationManager.AddAttestation(att.txid, att.attesterOutpoint,
+                                        att.vchSig, nCurrentHeight);
+
+    LogPrint("attestation", "Accepted attestation from %s for tx %s\n",
+             att.attesterOutpoint.ToString(), att.txid.ToString());
+
+    TryPromoteStagedTx(att.txid, vTxToRelay);
+    return true;
+}
+
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     const CChainParams& chainparams = Params();
@@ -8019,69 +8106,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             LOCK(cs_main);
             int nCurrentHeight = chainActive.Height();
 
-            // Validate attester is a confirmed fluxnode — use mapConfirmedFluxnodeData
-            // directly, not GetFluxnodeData() which also checks unconfirmed trackers
             FluxnodeCacheData attesterData;
-            {
-                LOCK(g_fluxnodeCache.cs);
-                auto it = g_fluxnodeCache.mapConfirmedFluxnodeData.find(att.attesterOutpoint);
-                if (it != g_fluxnodeCache.mapConfirmedFluxnodeData.end())
-                    attesterData = it->second;
-            }
-            if (attesterData.IsNull()) {
-                LogPrint("attestation", "fluxattest: attester %s not a confirmed fluxnode\n",
-                         att.attesterOutpoint.ToString());
-                return true;
-            }
-
-            // Verify signature
-            std::string strMessage = att.txid.GetHex() + att.attesterOutpoint.ToString();
-            std::string errorMessage;
-            if (!obfuScationSigner.VerifyMessage(attesterData.pubKey, att.vchSig, strMessage, errorMessage)) {
-                LogPrint("attestation", "fluxattest: invalid signature from %s: %s\n",
-                         att.attesterOutpoint.ToString(), errorMessage);
-                // Only penalize if pfrom IS the attester, not an honest relay
-                std::string attesterHost;
-                int attesterPort;
-                SplitHostPort(attesterData.ip, attesterPort, attesterHost);
-                if (pfrom->addr.ToStringIP() == attesterHost)
-                    Misbehaving(pfrom->GetId(), 10);
-                return true;
-            }
-
-            LOCK(g_attestationManager.cs);
-
-            if (!g_attestationManager.CheckPeerInvLimit(pfrom->GetId())) {
-                Misbehaving(pfrom->GetId(), 5);
-                return error("fluxattest: peer=%d exceeded attestation rate limit", pfrom->id);
-            }
-
-            if (g_attestationManager.HasSeenAttestation(attHash))
+            AttestationValidationResult result = ValidateAttestation(pfrom, att, attesterData);
+            if (result != ATT_VALID)
                 return true;
 
-            if (g_attestationManager.IsAttesterBanned(att.attesterOutpoint)) {
-                LogPrint("attestation", "fluxattest: attester %s is banned\n",
-                         att.attesterOutpoint.ToString());
-                return true;
-            }
-
-            if (!g_attestationManager.CheckAttesterRateLimit(att.attesterOutpoint, nCurrentHeight)) {
-                LogPrint("attestation", "fluxattest: attester %s exceeded rate limit\n",
-                         att.attesterOutpoint.ToString());
-                return true;
-            }
-
-            g_attestationManager.MarkAttestationSeen(attHash);
-            g_attestationManager.AddAttestation(att.txid, att.attesterOutpoint,
-                                                att.vchSig, nCurrentHeight);
-            fAccepted = true;
-
-            LogPrint("attestation", "Accepted attestation from %s for tx %s\n",
-                     att.attesterOutpoint.ToString(), att.txid.ToString());
-
-            TryPromoteStagedTx(att.txid, vTxToRelay);
+            fAccepted = AcceptAttestation(pfrom, att, attHash, nCurrentHeight, vTxToRelay);
         }
-        // cs_main and g_attestationManager.cs released
+        // cs_main released
 
         if (fAccepted) {
             for (const CTransaction& txToRelay : vTxToRelay) {

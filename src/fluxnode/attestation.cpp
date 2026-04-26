@@ -97,8 +97,7 @@ static std::set<std::string> BuildConfirmedFluxnodeIPSet()
 int CountClearnetFluxnodePeers()
 {
     int nCount = 0;
-    LOCK(cs_vNodes);
-    LOCK(g_fluxnodeCache.cs);
+    LOCK2(cs_vNodes, g_fluxnodeCache.cs);
     std::set<std::string> setFluxnodeIPs = BuildConfirmedFluxnodeIPSet();
     for (CNode* pnode : vNodes) {
         if (!pnode->addr.IsRoutable() || pnode->addr.IsTor())
@@ -123,8 +122,7 @@ std::string GetFluxnodePeerToConnect(int nCurrentHeight)
     std::set<std::string> setConnectedIPs;
     std::vector<std::string> vCandidates;
     {
-        LOCK(cs_vNodes);
-        LOCK(g_fluxnodeCache.cs);
+        LOCK2(cs_vNodes, g_fluxnodeCache.cs);
 
         std::set<std::string> setFluxnodeIPs = BuildConfirmedFluxnodeIPSet();
 

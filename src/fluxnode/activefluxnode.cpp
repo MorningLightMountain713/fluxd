@@ -389,16 +389,18 @@ void ActiveFluxnode::BuildDeterministicConfirmTx(CMutableTransaction& mutTransac
     // When we should move to upgraded version for fluxnode transactions
     bool fP2SHNodesActive = NetworkUpgradeActive(chainActive.Height(), Params().GetConsensus(), Consensus::UPGRADE_P2SHNODES);
 
-    // If this is the first confirmation tx we check for INITIAL_CONFIRM, and we must check the started list
-    if (nUpdateType == FluxnodeUpdateType::INITIAL_CONFIRM && g_fluxnodeCache.mapStartTxTracker.count(activeFluxnode.deterministicOutPoint)) {
-        // Set the active Fluxnode to the correct tx version, so it can create the confirmation transaction with the same version (5 or 6)
-        nActiveFluxNodeTxVersion = g_fluxnodeCache.mapStartTxTracker.at(activeFluxnode.deterministicOutPoint).nType;
-    }
-
-    // If this is the second confirmation tx we check for UPDATE_CONFIRM, and we must check the confirmed list
-    if (nUpdateType == FluxnodeUpdateType::UPDATE_CONFIRM && g_fluxnodeCache.mapConfirmedFluxnodeData.count(activeFluxnode.deterministicOutPoint)) {
-        // Set the active Fluxnode to the correct tx version, so it can create the confirmation transaction with the same version (5 or 6)
-        nActiveFluxNodeTxVersion = g_fluxnodeCache.mapConfirmedFluxnodeData.at(activeFluxnode.deterministicOutPoint).nType;
+    {
+        LOCK(g_fluxnodeCache.cs);
+        if (nUpdateType == FluxnodeUpdateType::INITIAL_CONFIRM) {
+            auto it = g_fluxnodeCache.mapStartTxTracker.find(activeFluxnode.deterministicOutPoint);
+            if (it != g_fluxnodeCache.mapStartTxTracker.end())
+                nActiveFluxNodeTxVersion = it->second.nType;
+        }
+        if (nUpdateType == FluxnodeUpdateType::UPDATE_CONFIRM) {
+            auto it = g_fluxnodeCache.mapConfirmedFluxnodeData.find(activeFluxnode.deterministicOutPoint);
+            if (it != g_fluxnodeCache.mapConfirmedFluxnodeData.end())
+                nActiveFluxNodeTxVersion = it->second.nType;
+        }
     }
 
     // Enforce a valid fluxnode tx version

@@ -2095,27 +2095,34 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
             }
         }
 
-        // Per-IP host limit for INITIAL_CONFIRM
-        if (tx.nType == FLUXNODE_CONFIRM_TX_TYPE && tx.nUpdateType == FluxnodeUpdateType::INITIAL_CONFIRM) {
-            std::string txHost;
-            int txPort;
-            SplitHostPort(tx.ip, txPort, txHost);
+        // Per-IP host limit for confirm transactions (INITIAL_CONFIRM always,
+        // UPDATE_CONFIRM only when IP changes)
+        if (tx.nType == FLUXNODE_CONFIRM_TX_TYPE) {
+            bool fCheckIpLimit = (tx.nUpdateType == FluxnodeUpdateType::INITIAL_CONFIRM);
+            if (!fCheckIpLimit && tx.nUpdateType == FluxnodeUpdateType::UPDATE_CONFIRM)
+                fCheckIpLimit = IsIpChanged(tx);
 
-            int nSameIpCount = 0;
-            {
-                LOCK(g_fluxnodeCache.cs);
-                for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
-                    std::string entryHost;
-                    int entryPort;
-                    SplitHostPort(data.ip, entryPort, entryHost);
-                    if (entryHost == txHost)
-                        nSameIpCount++;
+            if (fCheckIpLimit) {
+                std::string txHost;
+                int txPort;
+                SplitHostPort(tx.ip, txPort, txHost);
+
+                int nSameIpCount = 0;
+                {
+                    LOCK(g_fluxnodeCache.cs);
+                    for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+                        std::string entryHost;
+                        int entryPort;
+                        SplitHostPort(data.ip, entryPort, entryHost);
+                        if (entryHost == txHost)
+                            nSameIpCount++;
+                    }
                 }
-            }
-            if (nSameIpCount >= FLUXNODE_MAX_NODES_PER_IP) {
-                return state.DoS(10, error("AcceptToMemoryPool: fluxnode tx ip limit exceeded (%d nodes at %s)",
-                                           nSameIpCount, txHost),
-                                 REJECT_INVALID, "fluxnode-tx-ip-limit-exceeded");
+                if (nSameIpCount >= FLUXNODE_MAX_NODES_PER_IP) {
+                    return state.DoS(10, error("AcceptToMemoryPool: fluxnode tx ip limit exceeded (%d nodes at %s)",
+                                               nSameIpCount, txHost),
+                                     REJECT_INVALID, "fluxnode-tx-ip-limit-exceeded");
+                }
             }
         }
     }
@@ -6978,7 +6985,7 @@ bool static AlreadyHave(const CInv& inv) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     case MSG_FLUXNODE_ATTESTATION:
         {
             LOCK(g_attestationManager.cs);
-            return g_attestationManager.setSeenAttestations.count(inv.hash) > 0;
+            return g_attestationManager.HasSeenAttestation(inv.hash);
         }
     }
     // Don't know what it is, just say we already got one
@@ -7341,7 +7348,7 @@ bool static MaybeGenerateAttestation(CNode* pfrom, const CTransaction& tx,
 
     g_attestationManager.AddAttestation(txid, attOut.attesterOutpoint,
                                         vchSig, nCurrentHeight);
-    g_attestationManager.setSeenAttestations.insert(attHash);
+    g_attestationManager.MarkAttestationSeen(attHash);
 
     LogPrint("attestation", "Generated attestation for %s (attester %s)\n",
              txid.ToString(), attOut.attesterOutpoint.ToString());
@@ -7354,15 +7361,17 @@ bool static MaybeGenerateAttestation(CNode* pfrom, const CTransaction& tx,
  * Validates the tx, stages it, optionally generates a first-hop attestation,
  * and promotes to the real mempool if enough attestations are present.
  *
- * Caller must hold cs_main. Attestation relay happens after all locks
- * (cs_main, g_attestationManager.cs, g_fluxnodeCache.cs) are released,
- * to respect lock ordering with cs_mapRelay and cs_vNodes.
+ * Caller must hold cs_main. If an attestation is generated, it is returned
+ * via attOut so the caller can relay it after releasing cs_main.
  */
 void static ProcessAttestationTx(CNode* pfrom, const CTransaction& tx, const CInv& inv,
                                  int nCurrentHeight, CValidationState& state,
-                                 std::vector<CTransaction>& vTxToRelay)
+                                 std::vector<CTransaction>& vTxToRelay,
+                                 CFluxnodeAttestation& attOut, bool& fGeneratedAttestation)
     EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
+    fGeneratedAttestation = false;
+
     auto verifier = libflux::ProofVerifier::Strict();
     if (!CheckTransaction(tx, state, verifier)) {
         LogPrint("attestation", "Attestation staging: CheckTransaction failed for %s\n",
@@ -7370,42 +7379,18 @@ void static ProcessAttestationTx(CNode* pfrom, const CTransaction& tx, const CIn
         return;
     }
 
-    CFluxnodeAttestation generatedAtt;
-    bool fGeneratedAttestation = false;
+    LOCK(g_attestationManager.cs);
 
-    {
-        LOCK(g_attestationManager.cs);
+    if (g_attestationManager.HasTxInStaging(inv.hash) || AlreadyHave(inv))
+        return;
 
-        if (g_attestationManager.HasTxInStaging(inv.hash) || AlreadyHave(inv))
-            return;
+    g_attestationManager.AddToStaging(inv.hash, tx, nCurrentHeight);
+    LogPrint("attestation", "Staged confirm tx %s for attestation (need %d)\n",
+             inv.hash.ToString(), GetRequiredAttestationCount());
 
-        g_attestationManager.AddToStaging(inv.hash, tx, nCurrentHeight);
-        LogPrint("attestation", "Staged confirm tx %s for attestation (need %d)\n",
-                 inv.hash.ToString(), GetRequiredAttestationCount());
-
-        fGeneratedAttestation = MaybeGenerateAttestation(pfrom, tx, inv.hash,
-                                                         nCurrentHeight, generatedAtt);
-        TryPromoteStagedTx(inv.hash, vTxToRelay);
-    }
-    // g_attestationManager.cs released — safe to relay now
-
-    if (fGeneratedAttestation) {
-        uint256 attHash = generatedAtt.GetHash();
-        {
-            LOCK(cs_mapRelay);
-            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-            ss << generatedAtt;
-            CInv attInv(MSG_FLUXNODE_ATTESTATION, attHash);
-            mapRelay.insert(std::make_pair(attInv, ss));
-            vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, attInv));
-        }
-        {
-            LOCK(cs_vNodes);
-            for (CNode* pnode : vNodes) {
-                pnode->PushInventory(CInv(MSG_FLUXNODE_ATTESTATION, attHash));
-            }
-        }
-    }
+    fGeneratedAttestation = MaybeGenerateAttestation(pfrom, tx, inv.hash,
+                                                     nCurrentHeight, attOut);
+    TryPromoteStagedTx(inv.hash, vTxToRelay);
 }
 
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
@@ -7979,6 +7964,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         std::vector<CTransaction> vTxToRelay;
         CValidationState state;
+        CFluxnodeAttestation generatedAtt;
+        bool fGeneratedAttestation = false;
 
         {
             LOCK(cs_main);
@@ -7988,7 +7975,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
             int nCurrentHeight = chainActive.Height();
             if (NeedsAttestation(tx, nCurrentHeight)) {
-                ProcessAttestationTx(pfrom, tx, inv, nCurrentHeight, state, vTxToRelay);
+                ProcessAttestationTx(pfrom, tx, inv, nCurrentHeight, state,
+                                     vTxToRelay, generatedAtt, fGeneratedAttestation);
             } else {
                 ProcessNormalTx(pfrom, tx, inv, state, vTxToRelay);
             }
@@ -7996,6 +7984,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         for (const CTransaction& txToRelay : vTxToRelay) {
             RelayTransaction(txToRelay);
+        }
+        if (fGeneratedAttestation) {
+            RelayAttestation(generatedAtt);
         }
         int nDoS = 0;
         if (state.IsInvalid(nDoS)) {
@@ -8021,7 +8012,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         CInv inv(MSG_FLUXNODE_ATTESTATION, attHash);
         pfrom->AddInventoryKnown(inv);
 
-        // Collect promoted txs to relay after releasing all locks
         std::vector<CTransaction> vTxToRelay;
         bool fAccepted = false;
 
@@ -8029,11 +8019,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             LOCK(cs_main);
             int nCurrentHeight = chainActive.Height();
 
-            // Validate attester is a confirmed fluxnode (cache lock scoped tightly)
+            // Validate attester is a confirmed fluxnode — use mapConfirmedFluxnodeData
+            // directly, not GetFluxnodeData() which also checks unconfirmed trackers
             FluxnodeCacheData attesterData;
             {
                 LOCK(g_fluxnodeCache.cs);
-                attesterData = g_fluxnodeCache.GetFluxnodeData(att.attesterOutpoint);
+                auto it = g_fluxnodeCache.mapConfirmedFluxnodeData.find(att.attesterOutpoint);
+                if (it != g_fluxnodeCache.mapConfirmedFluxnodeData.end())
+                    attesterData = it->second;
             }
             if (attesterData.IsNull()) {
                 LogPrint("attestation", "fluxattest: attester %s not a confirmed fluxnode\n",
@@ -8041,77 +8034,60 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 return true;
             }
 
-            // Verify signature (no locks needed)
+            // Verify signature
             std::string strMessage = att.txid.GetHex() + att.attesterOutpoint.ToString();
             std::string errorMessage;
             if (!obfuScationSigner.VerifyMessage(attesterData.pubKey, att.vchSig, strMessage, errorMessage)) {
                 LogPrint("attestation", "fluxattest: invalid signature from %s: %s\n",
                          att.attesterOutpoint.ToString(), errorMessage);
-                Misbehaving(pfrom->GetId(), 10);
+                // Only penalize if pfrom IS the attester, not an honest relay
+                std::string attesterHost;
+                int attesterPort;
+                SplitHostPort(attesterData.ip, attesterPort, attesterHost);
+                if (pfrom->addr.ToStringIP() == attesterHost)
+                    Misbehaving(pfrom->GetId(), 10);
                 return true;
             }
 
-            // All attestation manager operations in one lock scope
-            {
-                LOCK(g_attestationManager.cs);
+            LOCK(g_attestationManager.cs);
 
-                if (!g_attestationManager.CheckPeerInvLimit(pfrom->GetId())) {
-                    Misbehaving(pfrom->GetId(), 5);
-                    return error("fluxattest: peer=%d exceeded attestation rate limit", pfrom->id);
-                }
-
-                if (g_attestationManager.setSeenAttestations.count(attHash))
-                    return true;
-
-                if (g_attestationManager.IsAttesterBanned(att.attesterOutpoint)) {
-                    LogPrint("attestation", "fluxattest: attester %s is banned\n",
-                             att.attesterOutpoint.ToString());
-                    return true;
-                }
-
-                if (!g_attestationManager.CheckAttesterRateLimit(att.attesterOutpoint, nCurrentHeight)) {
-                    LogPrint("attestation", "fluxattest: attester %s exceeded rate limit\n",
-                             att.attesterOutpoint.ToString());
-                    return true;
-                }
-
-                g_attestationManager.setSeenAttestations.insert(attHash);
-                g_attestationManager.AddAttestation(att.txid, att.attesterOutpoint,
-                                                    att.vchSig, nCurrentHeight);
-                fAccepted = true;
-
-                LogPrint("attestation", "Accepted attestation from %s for tx %s\n",
-                         att.attesterOutpoint.ToString(), att.txid.ToString());
-
-                TryPromoteStagedTx(att.txid, vTxToRelay);
+            if (!g_attestationManager.CheckPeerInvLimit(pfrom->GetId())) {
+                Misbehaving(pfrom->GetId(), 5);
+                return error("fluxattest: peer=%d exceeded attestation rate limit", pfrom->id);
             }
-            // g_attestationManager.cs released
+
+            if (g_attestationManager.HasSeenAttestation(attHash))
+                return true;
+
+            if (g_attestationManager.IsAttesterBanned(att.attesterOutpoint)) {
+                LogPrint("attestation", "fluxattest: attester %s is banned\n",
+                         att.attesterOutpoint.ToString());
+                return true;
+            }
+
+            if (!g_attestationManager.CheckAttesterRateLimit(att.attesterOutpoint, nCurrentHeight)) {
+                LogPrint("attestation", "fluxattest: attester %s exceeded rate limit\n",
+                         att.attesterOutpoint.ToString());
+                return true;
+            }
+
+            g_attestationManager.MarkAttestationSeen(attHash);
+            g_attestationManager.AddAttestation(att.txid, att.attesterOutpoint,
+                                                att.vchSig, nCurrentHeight);
+            fAccepted = true;
+
+            LogPrint("attestation", "Accepted attestation from %s for tx %s\n",
+                     att.attesterOutpoint.ToString(), att.txid.ToString());
+
+            TryPromoteStagedTx(att.txid, vTxToRelay);
         }
-        // cs_main released
+        // cs_main and g_attestationManager.cs released
 
         if (fAccepted) {
-            // Relay promoted txs (acquires cs_vNodes internally)
             for (const CTransaction& txToRelay : vTxToRelay) {
                 RelayTransaction(txToRelay);
             }
-
-            // Store attestation in mapRelay for getdata
-            {
-                LOCK(cs_mapRelay);
-                CInv relayInv(MSG_FLUXNODE_ATTESTATION, attHash);
-                CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-                ss << att;
-                mapRelay.insert(std::make_pair(relayInv, ss));
-                vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, relayInv));
-            }
-            // Relay attestation inv to peers
-            {
-                LOCK(cs_vNodes);
-                for (CNode* pnode : vNodes) {
-                    if (pnode->GetId() != pfrom->GetId())
-                        pnode->PushInventory(inv);
-                }
-            }
+            RelayAttestation(att);
         }
     }
 

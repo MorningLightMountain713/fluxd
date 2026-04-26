@@ -26,9 +26,6 @@ static const int FLUXNODE_MIN_CLEARNET_PEERS_TESTNET = 1;
 static const int FLUXNODE_ATTESTATION_EXPIRY_BLOCKS = 20;
 static const size_t FLUXNODE_PENDING_CONFIRM_MAX_ENTRIES = 5000;
 
-// Per-IP host limit
-static const int FLUXNODE_MAX_NODES_PER_IP = 8;
-
 // Spam defense
 static const int FLUXNODE_ATTESTATION_RATE_LIMIT_WINDOW = 20;  // blocks
 static const int FLUXNODE_ATTESTATION_RATE_LIMIT_PER_ATTESTER = 10;
@@ -79,47 +76,39 @@ class AttestationManager
 public:
     mutable CCriticalSection cs;
 
-    std::map<uint256, PendingConfirm> mapPendingConfirm;
-    std::set<uint256> setSeenAttestations;
-
-    // Per-attester rate limiting: outpoint -> count in current window
-    std::map<COutPoint, int> mapAttesterCount;
-    int nRateLimitWindowStart = 0;
-
-    // Per-attester orphan tracking: outpoint -> orphan count
-    std::map<COutPoint, int> mapAttesterOrphans;
-    std::set<COutPoint> setBannedAttesters;
-
-    // Per-peer inv rate limiting: node id -> (count, window start time)
-    std::map<int, std::pair<int, int64_t>> mapPeerInvCount;
-
     void AddToStaging(const uint256& txid, const CTransaction& tx, int nHeight);
     void AddAttestation(const uint256& txid, const COutPoint& attester,
                         const std::vector<unsigned char>& sig, int nHeight);
     bool IsReadyForPromotion(const uint256& txid) const;
     std::optional<CTransaction> GetPromotableTx(const uint256& txid) const;
     void RemoveFromStaging(const uint256& txid);
-    bool HasInStaging(const uint256& txid) const;
     bool HasTxInStaging(const uint256& txid) const;
+
+    bool HasSeenAttestation(const uint256& attHash) const;
+    void MarkAttestationSeen(const uint256& attHash);
 
     void CleanupExpired(int nCurrentHeight);
     void CleanupOnBlockConnected(const uint256& txid);
-    void EnforceCapLimit();
 
     bool CheckAttesterRateLimit(const COutPoint& attester, int nCurrentHeight);
     bool IsAttesterBanned(const COutPoint& attester) const;
     bool CheckPeerInvLimit(int nodeId);
 
-    void SetNull()
-    {
-        mapPendingConfirm.clear();
-        setSeenAttestations.clear();
-        mapAttesterCount.clear();
-        nRateLimitWindowStart = 0;
-        mapAttesterOrphans.clear();
-        setBannedAttesters.clear();
-        mapPeerInvCount.clear();
-    }
+    void SetNull();
+
+private:
+    std::map<uint256, PendingConfirm> mapPendingConfirm;
+    std::set<uint256> setSeenAttestations;
+
+    std::map<COutPoint, int> mapAttesterCount;
+    int nRateLimitWindowStart = 0;
+
+    std::map<COutPoint, int> mapAttesterOrphans;
+    std::set<COutPoint> setBannedAttesters;
+
+    std::map<int, std::pair<int, int64_t>> mapPeerInvCount;
+
+    void EnforceCapLimit();
 };
 
 extern AttestationManager g_attestationManager;
@@ -127,12 +116,10 @@ extern AttestationManager g_attestationManager;
 bool NeedsAttestation(const CTransaction& tx, int nHeight);
 bool IsIpChanged(const CTransaction& tx);
 
-// Called from net.cpp — returns a fluxnode address to connect to if we need
-// more fluxnode peers for attestation, or an empty string if no action needed.
-// Encapsulates all fluxnode cache access so net.cpp doesn't need fluxnode headers.
 std::string GetFluxnodePeerToConnect(int nCurrentHeight);
-
-// Called from activefluxnode.cpp — counts clearnet fluxnode peers.
 int CountClearnetFluxnodePeers();
+
+// Relay an attestation to peers via inv/mapRelay. Safe to call without locks held.
+void RelayAttestation(const CFluxnodeAttestation& att);
 
 #endif // FLUXNODE_ATTESTATION_H

@@ -43,6 +43,9 @@
 #define FLUXNODE_CONFIRM_TX_IP_ADDRESS_SIZE_V1 40
 #define FLUXNODE_CONFIRM_TX_IP_ADDRESS_SIZE_V2 60
 
+// Maximum confirmed fluxnodes per IP host
+#define FLUXNODE_MAX_NODES_PER_IP 8
+
 
 
 /// Mempool only

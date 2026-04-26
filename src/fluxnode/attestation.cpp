@@ -7,10 +7,15 @@
 #include "chainparams.h"
 #include "consensus/upgrades.h"
 #include "fluxnode/fluxnode.h"
+#include "hash.h"
 #include "main.h"
+#include "net.h"
 #include "netbase.h"
 #include "tinyformat.h"
 #include "util.h"
+
+#include <algorithm>
+#include <random>
 
 AttestationManager g_attestationManager;
 
@@ -26,6 +31,13 @@ int GetMinClearnetFluxnodePeers()
     bool fTestNet = GetBoolArg("-testnet", false);
     return fTestNet ? FLUXNODE_MIN_CLEARNET_PEERS_TESTNET
                     : FLUXNODE_MIN_CLEARNET_PEERS_MAINNET;
+}
+
+uint256 CFluxnodeAttestation::GetHash() const
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << txid << attesterOutpoint;
+    return ss.GetHash();
 }
 
 std::string CFluxnodeAttestation::ToString() const
@@ -67,6 +79,88 @@ bool IsIpChanged(const CTransaction& tx)
     SplitHostPort(tx.ip, txPort, txHost);
     SplitHostPort(data.ip, dataPort, dataHost);
     return txHost != dataHost;
+}
+
+int CountClearnetFluxnodePeers()
+{
+    int nCount = 0;
+    LOCK(cs_vNodes);
+    LOCK(g_fluxnodeCache.cs);
+    for (CNode* pnode : vNodes) {
+        if (!pnode->addr.IsRoutable() || pnode->addr.IsTor())
+            continue;
+        std::string peerHost = pnode->addr.ToStringIP();
+        for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+            std::string entryHost;
+            int entryPort;
+            SplitHostPort(data.ip, entryPort, entryHost);
+            if (entryHost == peerHost) {
+                nCount++;
+                break;
+            }
+        }
+    }
+    return nCount;
+}
+
+std::string GetFluxnodePeerToConnect(int nCurrentHeight)
+{
+    if (!fFluxnode)
+        return "";
+
+    bool fAttestationActive = NetworkUpgradeActive(
+        nCurrentHeight, Params().GetConsensus(), Consensus::UPGRADE_IP_ATTESTATION);
+    if (!fAttestationActive)
+        return "";
+
+    int nFluxnodePeers = 0;
+    std::set<std::string> setConnectedIPs;
+    {
+        LOCK(cs_vNodes);
+        LOCK(g_fluxnodeCache.cs);
+        for (CNode* pnode : vNodes) {
+            if (pnode->fInbound || !pnode->addr.IsRoutable() || pnode->addr.IsTor())
+                continue;
+            std::string peerHost = pnode->addr.ToStringIP();
+            for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+                std::string entryHost;
+                int entryPort;
+                SplitHostPort(data.ip, entryPort, entryHost);
+                if (entryHost == peerHost) {
+                    nFluxnodePeers++;
+                    setConnectedIPs.insert(peerHost);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (nFluxnodePeers >= 2)
+        return "";
+
+    LOCK(g_fluxnodeCache.cs);
+    std::vector<std::string> vCandidates;
+    for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+        std::string entryHost;
+        int entryPort;
+        SplitHostPort(data.ip, entryPort, entryHost);
+        if (setConnectedIPs.count(entryHost))
+            continue;
+        CNetAddr netAddr(entryHost, false);
+        if (!netAddr.IsValid() || !netAddr.IsRoutable() || netAddr.IsTor())
+            continue;
+        vCandidates.push_back(entryHost);
+    }
+
+    if (vCandidates.empty())
+        return "";
+
+    std::shuffle(vCandidates.begin(), vCandidates.end(),
+                 std::mt19937(std::random_device()()));
+
+    LogPrint("attestation", "Connecting to fluxnode peer %s (have %d fluxnode peers)\n",
+             vCandidates.front(), nFluxnodePeers);
+    return vCandidates.front();
 }
 
 // --- AttestationManager ---
@@ -115,7 +209,6 @@ bool AttestationManager::IsReadyForPromotion(const uint256& txid) const
 
     int nRequired = GetRequiredAttestationCount();
 
-    // Filter out self-attestation from count
     const COutPoint& collateral = it->second.tx->collateralIn;
     int nValid = 0;
     for (const auto& [attester, sig] : it->second.mapAttestations) {
@@ -139,7 +232,6 @@ void AttestationManager::RemoveFromStaging(const uint256& txid)
     AssertLockHeld(cs);
     auto it = mapPendingConfirm.find(txid);
     if (it != mapPendingConfirm.end()) {
-        // Clean up seen attestation hashes for this entry
         for (const auto& [attester, sig] : it->second.mapAttestations) {
             CHashWriter ss(SER_GETHASH, 0);
             ss << txid << attester;
@@ -171,7 +263,6 @@ void AttestationManager::CleanupExpired(int nCurrentHeight)
     for (const auto& [txid, entry] : mapPendingConfirm) {
         if (entry.nBlockFirstSeen > 0 &&
             (nCurrentHeight - entry.nBlockFirstSeen) >= FLUXNODE_ATTESTATION_EXPIRY_BLOCKS) {
-            // Track orphaned attestations (attestations without matching tx)
             if (!entry.tx.has_value()) {
                 for (const auto& [attester, sig] : entry.mapAttestations) {
                     mapAttesterOrphans[attester]++;
@@ -189,7 +280,6 @@ void AttestationManager::CleanupExpired(int nCurrentHeight)
         RemoveFromStaging(txid);
     }
 
-    // Reset rate limit window if needed
     if (nRateLimitWindowStart > 0 &&
         (nCurrentHeight - nRateLimitWindowStart) >= FLUXNODE_ATTESTATION_RATE_LIMIT_WINDOW) {
         mapAttesterCount.clear();
@@ -209,7 +299,6 @@ void AttestationManager::EnforceCapLimit()
 {
     AssertLockHeld(cs);
     while (mapPendingConfirm.size() > FLUXNODE_PENDING_CONFIRM_MAX_ENTRIES) {
-        // Evict oldest entry
         int nOldestHeight = std::numeric_limits<int>::max();
         uint256 oldestTxid;
         for (const auto& [txid, entry] : mapPendingConfirm) {
@@ -246,7 +335,7 @@ bool AttestationManager::IsAttesterBanned(const COutPoint& attester) const
     return setBannedAttesters.count(attester) > 0;
 }
 
-bool AttestationManager::CheckPeerInvLimit(NodeId nodeId)
+bool AttestationManager::CheckPeerInvLimit(int nodeId)
 {
     AssertLockHeld(cs);
     int64_t nNow = GetTime();

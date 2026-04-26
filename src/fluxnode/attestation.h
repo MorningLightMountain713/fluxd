@@ -5,7 +5,6 @@
 #ifndef FLUXNODE_ATTESTATION_H
 #define FLUXNODE_ATTESTATION_H
 
-#include "hash.h"
 #include "primitives/transaction.h"
 #include "serialize.h"
 #include "sync.h"
@@ -14,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 // Attestation thresholds
@@ -61,13 +61,7 @@ public:
         READWRITE(vchSig);
     }
 
-    uint256 GetHash() const
-    {
-        CHashWriter ss(SER_GETHASH, 0);
-        ss << txid << attesterOutpoint;
-        return ss.GetHash();
-    }
-
+    uint256 GetHash() const;
     std::string ToString() const;
 };
 
@@ -97,7 +91,7 @@ public:
     std::set<COutPoint> setBannedAttesters;
 
     // Per-peer inv rate limiting: node id -> (count, window start time)
-    std::map<NodeId, std::pair<int, int64_t>> mapPeerInvCount;
+    std::map<int, std::pair<int, int64_t>> mapPeerInvCount;
 
     void AddToStaging(const uint256& txid, const CTransaction& tx, int nHeight);
     void AddAttestation(const uint256& txid, const COutPoint& attester,
@@ -114,7 +108,7 @@ public:
 
     bool CheckAttesterRateLimit(const COutPoint& attester, int nCurrentHeight);
     bool IsAttesterBanned(const COutPoint& attester) const;
-    bool CheckPeerInvLimit(NodeId nodeId);
+    bool CheckPeerInvLimit(int nodeId);
 
     void SetNull()
     {
@@ -132,5 +126,13 @@ extern AttestationManager g_attestationManager;
 
 bool NeedsAttestation(const CTransaction& tx, int nHeight);
 bool IsIpChanged(const CTransaction& tx);
+
+// Called from net.cpp — returns a fluxnode address to connect to if we need
+// more fluxnode peers for attestation, or an empty string if no action needed.
+// Encapsulates all fluxnode cache access so net.cpp doesn't need fluxnode headers.
+std::string GetFluxnodePeerToConnect(int nCurrentHeight);
+
+// Called from activefluxnode.cpp — counts clearnet fluxnode peers.
+int CountClearnetFluxnodePeers();
 
 #endif // FLUXNODE_ATTESTATION_H

@@ -7,38 +7,15 @@
 
 #include "activefluxnode.h"
 #include "addrman.h"
+#include "consensus/upgrades.h"
 #include "fluxnode/attestation.h"
 #include "fluxnode/fluxnode.h"
 #include "fluxnode/fluxnodeconfig.h"
 #include "protocol.h"
 
-#include "consensus/upgrades.h"
 #include "key_io.h"
-#include "netbase.h"
 #include "fluxnode/benchmarks.h"
 
-
-static int CountClearnetFluxnodePeers()
-{
-    int nCount = 0;
-    LOCK(cs_vNodes);
-    LOCK(g_fluxnodeCache.cs);
-    for (CNode* pnode : vNodes) {
-        if (!pnode->addr.IsRoutable() || pnode->addr.IsTor())
-            continue;
-        std::string peerHost = pnode->addr.ToStringIP();
-        for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
-            std::string entryHost;
-            int entryPort;
-            SplitHostPort(data.ip, entryPort, entryHost);
-            if (entryHost == peerHost) {
-                nCount++;
-                break;
-            }
-        }
-    }
-    return nCount;
-}
 
 void ActiveFluxnode::ManageDeterministricFluxnode()
 {

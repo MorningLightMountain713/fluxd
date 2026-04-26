@@ -7325,7 +7325,7 @@ bool static MaybeGenerateAttestation(CNode* pfrom, const CTransaction& tx,
         CKey fluxnodeKey;
         CPubKey fluxnodePubKey;
 
-        if (!activeFluxnode.GetFluxNodeVin(CTxIn(), fluxnodePubKey, fluxnodeKey))
+        if (!obfuScationSigner.SetKey(strFluxnodePrivKey, errorMessage, fluxnodeKey, fluxnodePubKey))
             return false;
 
         if (!obfuScationSigner.SignMessage(strMessage, errorMessage, vchSig, fluxnodeKey)) {

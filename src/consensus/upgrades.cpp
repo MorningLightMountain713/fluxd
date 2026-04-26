@@ -64,6 +64,11 @@ const struct NUInfo NetworkUpgradeInfo[Consensus::MAX_NETWORK_UPGRADES] = {
             /*.nBranchId =*/ 0x76b809bb,
             /*.strName =*/ "PON",
             /*.strInfo =*/ "Proof of Node activation",
+    },
+    {
+            /*.nBranchId =*/ 0x76b809bb,
+            /*.strName =*/ "IPAttestation",
+            /*.strInfo =*/ "IP attestation for fluxnode confirm transactions",
     }
 };
 

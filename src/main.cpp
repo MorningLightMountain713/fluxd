@@ -43,6 +43,7 @@
 #include "fluxnode/fluxnodecachedb.h"
 #include "fluxnode/obfuscation.h"
 #include "fluxnode/activefluxnode.h"
+#include "fluxnode/attestation.h"
 
 #include <sstream>
 #include <filesystem>
@@ -1814,6 +1815,18 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
                         REJECT_INVALID, "bad-txns-fluxnode-tx-ip-address-to-large");
             }
 
+            // IP format validation: reject non-routable addresses
+            {
+                std::string ipHost;
+                int ipPort;
+                SplitHostPort(tx.ip, ipPort, ipHost);
+                CNetAddr addr(ipHost, false);
+                if (!addr.IsValid() || !addr.IsRoutable()) {
+                    return state.DoS(100, error("CheckTransaction(): fluxnode tx ip not routable"),
+                                     REJECT_INVALID, "bad-txns-fluxnode-tx-ip-not-routable");
+                }
+            }
+
             if (tx.nUpdateType != FluxnodeUpdateType::INITIAL_CONFIRM && tx.nUpdateType != FluxnodeUpdateType::UPDATE_CONFIRM) {
                 return state.DoS(10, error("CheckTransaction(): Is Fluxnode Tx, invalid update type"),
                                  REJECT_INVALID, "bad-txns-fluxnode-tx-invalid-update-type");
@@ -2079,6 +2092,30 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
                     LogPrint("mempool", "Dropping confirmation fluxnode txid %s : failed CheckConfirmationHeights check\n", tx.GetHash().ToString());
                     return false;
                 }
+            }
+        }
+
+        // Per-IP host limit for INITIAL_CONFIRM
+        if (tx.nType == FLUXNODE_CONFIRM_TX_TYPE && tx.nUpdateType == FluxnodeUpdateType::INITIAL_CONFIRM) {
+            std::string txHost;
+            int txPort;
+            SplitHostPort(tx.ip, txPort, txHost);
+
+            int nSameIpCount = 0;
+            {
+                LOCK(g_fluxnodeCache.cs);
+                for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+                    std::string entryHost;
+                    int entryPort;
+                    SplitHostPort(data.ip, entryPort, entryHost);
+                    if (entryHost == txHost)
+                        nSameIpCount++;
+                }
+            }
+            if (nSameIpCount >= FLUXNODE_MAX_NODES_PER_IP) {
+                return state.DoS(10, error("AcceptToMemoryPool: fluxnode tx ip limit exceeded (%d nodes at %s)",
+                                           nSameIpCount, txHost),
+                                 REJECT_INVALID, "fluxnode-tx-ip-limit-exceeded");
             }
         }
     }
@@ -4650,6 +4687,16 @@ bool static ConnectTip(CValidationState& state, const CChainParams& chainparams,
     // Remove transactions that expire at new block height from mempool
     mempool.removeExpired(pindexNew->nHeight);
 
+    // Clean up attestation staging: remove mined txs and expire old entries
+    {
+        LOCK(g_attestationManager.cs);
+        for (const CTransaction& tx : pblock->vtx) {
+            if (tx.IsFluxnodeTx() && (tx.nType & FLUXNODE_CONFIRM_TX_TYPE))
+                g_attestationManager.CleanupOnBlockConnected(tx.GetHash());
+        }
+        g_attestationManager.CleanupExpired(pindexNew->nHeight);
+    }
+
     if (fDebug) {
         // Logging fluxnodecache start and dos information
         g_fluxnodeCache.LogDebugData(pindexNew->nHeight, pindexNew->GetBlockHash(), false);
@@ -6928,6 +6975,11 @@ bool static AlreadyHave(const CInv& inv) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     case MSG_BLOCK:
     case MSG_CMPCT_BLOCK:
         return mapBlockIndex.count(inv.hash);
+    case MSG_FLUXNODE_ATTESTATION:
+        {
+            LOCK(g_attestationManager.cs);
+            return g_attestationManager.setSeenAttestations.count(inv.hash) > 0;
+        }
     }
     // Don't know what it is, just say we already got one
     return true;
@@ -7089,6 +7141,270 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
         // risk analyze) the dependencies of transactions relevant to them, without
         // having to download the entire memory pool.
         pfrom->PushMessage("notfound", vNotFound);
+    }
+}
+
+/**
+ * Accept a normal transaction to the mempool, process dependent orphans, and
+ * queue accepted transactions for relay.
+ *
+ * Caller must hold cs_main.
+ */
+void static ProcessNormalTx(CNode* pfrom, const CTransaction& tx, const CInv& inv,
+                            CValidationState& state, std::vector<CTransaction>& vTxToRelay)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    bool fMissingInputs = false;
+
+    if (!AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
+    {
+        mempool.check(pcoinsTip);
+        vTxToRelay.push_back(tx);
+
+        LogPrint("mempool", "AcceptToMemoryPool: peer=%d %s: accepted %s (poolsz %u)\n",
+            pfrom->id, pfrom->cleanSubVer,
+            tx.GetHash().ToString(),
+            mempool.mapTx.size());
+
+        // Recursively process any orphan transactions that depended on this one
+        vector<uint256> vWorkQueue;
+        vector<uint256> vEraseQueue;
+        vWorkQueue.push_back(inv.hash);
+
+        set<NodeId> setMisbehaving;
+        for (unsigned int i = 0; i < vWorkQueue.size(); i++)
+        {
+            map<uint256, set<uint256> >::iterator itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue[i]);
+            if (itByPrev == mapOrphanTransactionsByPrev.end())
+                continue;
+            for (set<uint256>::iterator mi = itByPrev->second.begin();
+                 mi != itByPrev->second.end();
+                 ++mi)
+            {
+                const uint256& orphanHash = *mi;
+                const CTransaction& orphanTx = mapOrphanTransactions[orphanHash].tx;
+                NodeId fromPeer = mapOrphanTransactions[orphanHash].fromPeer;
+                bool fMissingInputs2 = false;
+                CValidationState stateDummy;
+
+                if (setMisbehaving.count(fromPeer))
+                    continue;
+                if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2))
+                {
+                    LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
+                    vTxToRelay.push_back(orphanTx);
+                    vWorkQueue.push_back(orphanHash);
+                    vEraseQueue.push_back(orphanHash);
+                }
+                else if (!fMissingInputs2)
+                {
+                    int nDos = 0;
+                    if (stateDummy.IsInvalid(nDos) && nDos > 0)
+                    {
+                        Misbehaving(fromPeer, nDos);
+                        setMisbehaving.insert(fromPeer);
+                        LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
+                    }
+                    LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
+                    vEraseQueue.push_back(orphanHash);
+                    assert(recentRejects);
+                    if (!stateDummy.IsFluxnodeTxSignatureFailure()) {
+                        recentRejects->insert(orphanHash);
+                    }
+                    AddTxToExtraPool(orphanTx);
+                }
+                mempool.check(pcoinsTip);
+            }
+        }
+
+        for (uint256 hash : vEraseQueue)
+            EraseOrphanTx(hash);
+    }
+    else if (fMissingInputs &&
+             tx.vJoinSplit.empty() &&
+             tx.vShieldedSpend.empty() &&
+             tx.vShieldedOutput.empty())
+    {
+        AddOrphanTx(tx, pfrom->GetId());
+
+        unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
+        unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
+        if (nEvicted > 0)
+            LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+    } else {
+        assert(recentRejects);
+        if (!state.IsFluxnodeTxSignatureFailure()) {
+            recentRejects->insert(tx.GetHash());
+        }
+        AddTxToExtraPool(tx);
+
+        if (pfrom->fWhitelisted) {
+            int nDoS = 0;
+            if (!state.IsInvalid(nDoS) || nDoS == 0) {
+                LogPrintf("Force relaying tx %s from whitelisted peer=%d\n", tx.GetHash().ToString(), pfrom->id);
+                vTxToRelay.push_back(tx);
+            } else {
+                LogPrintf("Not relaying invalid transaction %s from whitelisted peer=%d (%s (code %d))\n",
+                    tx.GetHash().ToString(), pfrom->id, state.GetRejectReason(), state.GetRejectCode());
+            }
+        }
+    }
+}
+
+/**
+ * Try to promote a staged transaction to the real mempool once it has enough
+ * attestations. Returns true if the tx was promoted.
+ *
+ * Caller must hold cs_main and g_attestationManager.cs.
+ */
+bool static TryPromoteStagedTx(const uint256& txid, std::vector<CTransaction>& vTxToRelay)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_attestationManager.cs)
+{
+    if (!g_attestationManager.IsReadyForPromotion(txid))
+        return false;
+
+    auto promoteTx = g_attestationManager.GetPromotableTx(txid);
+    if (!promoteTx.has_value())
+        return false;
+
+    CTransaction tx = *promoteTx;
+    g_attestationManager.RemoveFromStaging(txid);
+
+    CValidationState promoteState;
+    bool fMissingInputs = false;
+    if (AcceptToMemoryPool(mempool, promoteState, tx, true, &fMissingInputs)) {
+        mempool.check(pcoinsTip);
+        vTxToRelay.push_back(tx);
+        LogPrint("attestation", "Promoted attested tx %s to mempool\n", txid.ToString());
+        return true;
+    }
+
+    LogPrint("attestation", "Promoted tx %s failed AcceptToMemoryPool: %s\n",
+             txid.ToString(), promoteState.GetRejectReason());
+    return false;
+}
+
+/**
+ * Generate an attestation for a confirm tx if this node is a confirmed
+ * fluxnode and pfrom->addr matches tx.ip. Returns the attestation via
+ * the output parameter; the caller is responsible for relay after
+ * releasing locks.
+ *
+ * Caller must hold cs_main and g_attestationManager.cs.
+ */
+bool static MaybeGenerateAttestation(CNode* pfrom, const CTransaction& tx,
+                                     const uint256& txid, int nCurrentHeight,
+                                     CFluxnodeAttestation& attOut)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_attestationManager.cs)
+{
+    if (!fFluxnode)
+        return false;
+
+    std::string txHost;
+    int txPort;
+    SplitHostPort(tx.ip, txPort, txHost);
+    std::string peerHost = pfrom->addr.ToStringIP();
+
+    if (txHost != peerHost)
+        return false;
+
+    // Scope g_fluxnodeCache.cs tightly — must not hold it when the caller
+    // later acquires cs_mapRelay or cs_vNodes, to avoid lock order inversion
+    // with CountClearnetFluxnodePeers (which takes cs_vNodes → g_fluxnodeCache.cs).
+    std::vector<unsigned char> vchSig;
+    {
+        LOCK(g_fluxnodeCache.cs);
+        if (!g_fluxnodeCache.InConfirmTracker(activeFluxnode.deterministicOutPoint))
+            return false;
+
+        if (activeFluxnode.deterministicOutPoint == tx.collateralIn)
+            return false;
+
+        std::string strMessage = txid.GetHex() + activeFluxnode.deterministicOutPoint.ToString();
+        std::string errorMessage;
+        CKey fluxnodeKey;
+        CPubKey fluxnodePubKey;
+
+        if (!activeFluxnode.GetFluxNodeVin(CTxIn(), fluxnodePubKey, fluxnodeKey))
+            return false;
+
+        if (!obfuScationSigner.SignMessage(strMessage, errorMessage, vchSig, fluxnodeKey)) {
+            LogPrint("attestation", "Failed to sign attestation for %s: %s\n",
+                     txid.ToString(), errorMessage);
+            return false;
+        }
+    }
+    // g_fluxnodeCache.cs released
+
+    attOut = CFluxnodeAttestation(txid, activeFluxnode.deterministicOutPoint, vchSig);
+    uint256 attHash = attOut.GetHash();
+
+    g_attestationManager.AddAttestation(txid, attOut.attesterOutpoint,
+                                        vchSig, nCurrentHeight);
+    g_attestationManager.setSeenAttestations.insert(attHash);
+
+    LogPrint("attestation", "Generated attestation for %s (attester %s)\n",
+             txid.ToString(), attOut.attesterOutpoint.ToString());
+
+    return true;
+}
+
+/**
+ * Handle a confirm transaction that requires IP attestation.
+ * Validates the tx, stages it, optionally generates a first-hop attestation,
+ * and promotes to the real mempool if enough attestations are present.
+ *
+ * Caller must hold cs_main. Attestation relay happens after all locks
+ * (cs_main, g_attestationManager.cs, g_fluxnodeCache.cs) are released,
+ * to respect lock ordering with cs_mapRelay and cs_vNodes.
+ */
+void static ProcessAttestationTx(CNode* pfrom, const CTransaction& tx, const CInv& inv,
+                                 int nCurrentHeight, CValidationState& state,
+                                 std::vector<CTransaction>& vTxToRelay)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    auto verifier = libflux::ProofVerifier::Strict();
+    if (!CheckTransaction(tx, state, verifier)) {
+        LogPrint("attestation", "Attestation staging: CheckTransaction failed for %s\n",
+                 tx.GetHash().ToString());
+        return;
+    }
+
+    CFluxnodeAttestation generatedAtt;
+    bool fGeneratedAttestation = false;
+
+    {
+        LOCK(g_attestationManager.cs);
+
+        if (g_attestationManager.HasTxInStaging(inv.hash) || AlreadyHave(inv))
+            return;
+
+        g_attestationManager.AddToStaging(inv.hash, tx, nCurrentHeight);
+        LogPrint("attestation", "Staged confirm tx %s for attestation (need %d)\n",
+                 inv.hash.ToString(), GetRequiredAttestationCount());
+
+        fGeneratedAttestation = MaybeGenerateAttestation(pfrom, tx, inv.hash,
+                                                         nCurrentHeight, generatedAtt);
+        TryPromoteStagedTx(inv.hash, vTxToRelay);
+    }
+    // g_attestationManager.cs released — safe to relay now
+
+    if (fGeneratedAttestation) {
+        uint256 attHash = generatedAtt.GetHash();
+        {
+            LOCK(cs_mapRelay);
+            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+            ss << generatedAtt;
+            CInv attInv(MSG_FLUXNODE_ATTESTATION, attHash);
+            mapRelay.insert(std::make_pair(attInv, ss));
+            vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, attInv));
+        }
+        {
+            LOCK(cs_vNodes);
+            for (CNode* pnode : vNodes) {
+                pnode->PushInventory(CInv(MSG_FLUXNODE_ATTESTATION, attHash));
+            }
+        }
     }
 }
 
@@ -7655,18 +7971,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             return false;
         }
 
-        vector<uint256> vWorkQueue;
-        vector<uint256> vEraseQueue;
         CTransaction tx;
         vRecv >> tx;
 
         CInv inv(MSG_TX, tx.GetHash());
         pfrom->AddInventoryKnown(inv);
 
-        // Collect transactions to relay after releasing cs_main
         std::vector<CTransaction> vTxToRelay;
-
-        bool fMissingInputs = false;
         CValidationState state;
 
         {
@@ -7675,132 +7986,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->setAskFor.erase(inv.hash);
             mapAlreadyAskedFor.erase(inv);
 
-            if (!AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
-            {
-                mempool.check(pcoinsTip);
-                vTxToRelay.push_back(tx);  // Queue for relay after releasing cs_main
-                vWorkQueue.push_back(inv.hash);
-
-                LogPrint("mempool", "AcceptToMemoryPool: peer=%d %s: accepted %s (poolsz %u)\n",
-                    pfrom->id, pfrom->cleanSubVer,
-                    tx.GetHash().ToString(),
-                    mempool.mapTx.size());
-
-                // Recursively process any orphan transactions that depended on this one
-                set<NodeId> setMisbehaving;
-                for (unsigned int i = 0; i < vWorkQueue.size(); i++)
-                {
-                    map<uint256, set<uint256> >::iterator itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue[i]);
-                    if (itByPrev == mapOrphanTransactionsByPrev.end())
-                        continue;
-                    for (set<uint256>::iterator mi = itByPrev->second.begin();
-                         mi != itByPrev->second.end();
-                         ++mi)
-                    {
-                        const uint256& orphanHash = *mi;
-                        const CTransaction& orphanTx = mapOrphanTransactions[orphanHash].tx;
-                        NodeId fromPeer = mapOrphanTransactions[orphanHash].fromPeer;
-                        bool fMissingInputs2 = false;
-                        // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
-                        // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
-                        // anyone relaying LegitTxX banned)
-                        CValidationState stateDummy;
-
-
-                        if (setMisbehaving.count(fromPeer))
-                            continue;
-                        if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2))
-                        {
-                            LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
-                            vTxToRelay.push_back(orphanTx);  // Queue for relay after releasing cs_main
-                            vWorkQueue.push_back(orphanHash);
-                            vEraseQueue.push_back(orphanHash);
-                        }
-                        else if (!fMissingInputs2)
-                        {
-                            int nDos = 0;
-                            if (stateDummy.IsInvalid(nDos) && nDos > 0)
-                            {
-                                // Punish peer that gave us an invalid orphan tx
-                                Misbehaving(fromPeer, nDos);
-                                setMisbehaving.insert(fromPeer);
-                                LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
-                            }
-                            // Has inputs but not accepted to mempool
-                            // Probably non-standard or insufficient fee/priority
-                            LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
-                            vEraseQueue.push_back(orphanHash);
-                            assert(recentRejects);
-                            // Don't blacklist by txid if failure was due to fluxnode signature validation
-                            if (!stateDummy.IsFluxnodeTxSignatureFailure()) {
-                                recentRejects->insert(orphanHash);
-                            }
-                            // Add to extra pool for compact block reconstruction
-                            AddTxToExtraPool(orphanTx);
-                        }
-                        mempool.check(pcoinsTip);
-                    }
-                }
-
-                for (uint256 hash : vEraseQueue)
-                    EraseOrphanTx(hash);
-            }
-            // TODO: currently, prohibit joinsplits and shielded spends/outputs from entering mapOrphans
-            else if (fMissingInputs &&
-                     tx.vJoinSplit.empty() &&
-                     tx.vShieldedSpend.empty() &&
-                     tx.vShieldedOutput.empty())
-            {
-                AddOrphanTx(tx, pfrom->GetId());
-
-                // DoS prevention: do not allow mapOrphanTransactions to grow unbounded
-                unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
-                unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
-                if (nEvicted > 0)
-                    LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+            int nCurrentHeight = chainActive.Height();
+            if (NeedsAttestation(tx, nCurrentHeight)) {
+                ProcessAttestationTx(pfrom, tx, inv, nCurrentHeight, state, vTxToRelay);
             } else {
-                assert(recentRejects);
-                // Don't blacklist by txid if failure was due to fluxnode signature validation.
-                // Fluxnode tx signatures are not committed to the txid (excluded via SER_GETHASH),
-                // so an attacker could poison the hash with an invalid signature, blocking valid txs.
-                // We still DoS the peer that sent the invalid signature.
-                if (!state.IsFluxnodeTxSignatureFailure()) {
-                    recentRejects->insert(tx.GetHash());
-                }
-                // Add to extra pool for compact block reconstruction
-                AddTxToExtraPool(tx);
-
-                if (pfrom->fWhitelisted) {
-                    // Always relay transactions received from whitelisted peers, even
-                    // if they were already in the mempool or rejected from it due
-                    // to policy, allowing the node to function as a gateway for
-                    // nodes hidden behind it.
-                    //
-                    // Never relay transactions that we would assign a non-zero DoS
-                    // score for, as we expect peers to do the same with us in that
-                    // case.
-                    int nDoS = 0;
-                    if (!state.IsInvalid(nDoS) || nDoS == 0) {
-                        LogPrintf("Force relaying tx %s from whitelisted peer=%d\n", tx.GetHash().ToString(), pfrom->id);
-                        vTxToRelay.push_back(tx);  // Queue for relay after releasing cs_main
-                    } else {
-                        LogPrintf("Not relaying invalid transaction %s from whitelisted peer=%d (%s (code %d))\n",
-                            tx.GetHash().ToString(), pfrom->id, state.GetRejectReason(), state.GetRejectCode());
-                    }
-                }
+                ProcessNormalTx(pfrom, tx, inv, state, vTxToRelay);
             }
         }  // Release cs_main here
 
-        // Relay all queued transactions without holding cs_main
-        // This prevents holding cs_main during network operations and avoids
-        // potential deadlock with cs_vNodes (which RelayTransaction acquires)
-        for (const CTransaction& txToRelay : vTxToRelay)
-        {
+        for (const CTransaction& txToRelay : vTxToRelay) {
             RelayTransaction(txToRelay);
         }
         int nDoS = 0;
-        if (state.IsInvalid(nDoS))
-        {
+        if (state.IsInvalid(nDoS)) {
             LogPrint("mempool", "%s from peer=%d %s was not accepted into the memory pool: %s\n", tx.GetHash().ToString(),
                 pfrom->id, pfrom->cleanSubVer,
                 state.GetRejectReason());
@@ -7810,6 +8008,113 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 Misbehaving(pfrom->GetId(), nDoS);
         }
     }
+
+    else if (strCommand == "fluxattest")
+    {
+        if (IsInitialBlockDownload(Params()))
+            return false;
+
+        CFluxnodeAttestation att;
+        vRecv >> att;
+
+        uint256 attHash = att.GetHash();
+        CInv inv(MSG_FLUXNODE_ATTESTATION, attHash);
+        pfrom->AddInventoryKnown(inv);
+
+        // Collect promoted txs to relay after releasing all locks
+        std::vector<CTransaction> vTxToRelay;
+        bool fAccepted = false;
+
+        {
+            LOCK(cs_main);
+            int nCurrentHeight = chainActive.Height();
+
+            // Validate attester is a confirmed fluxnode (cache lock scoped tightly)
+            FluxnodeCacheData attesterData;
+            {
+                LOCK(g_fluxnodeCache.cs);
+                attesterData = g_fluxnodeCache.GetFluxnodeData(att.attesterOutpoint);
+            }
+            if (attesterData.IsNull()) {
+                LogPrint("attestation", "fluxattest: attester %s not a confirmed fluxnode\n",
+                         att.attesterOutpoint.ToString());
+                return true;
+            }
+
+            // Verify signature (no locks needed)
+            std::string strMessage = att.txid.GetHex() + att.attesterOutpoint.ToString();
+            std::string errorMessage;
+            if (!obfuScationSigner.VerifyMessage(attesterData.pubKey, att.vchSig, strMessage, errorMessage)) {
+                LogPrint("attestation", "fluxattest: invalid signature from %s: %s\n",
+                         att.attesterOutpoint.ToString(), errorMessage);
+                Misbehaving(pfrom->GetId(), 10);
+                return true;
+            }
+
+            // All attestation manager operations in one lock scope
+            {
+                LOCK(g_attestationManager.cs);
+
+                if (!g_attestationManager.CheckPeerInvLimit(pfrom->GetId())) {
+                    Misbehaving(pfrom->GetId(), 5);
+                    return error("fluxattest: peer=%d exceeded attestation rate limit", pfrom->id);
+                }
+
+                if (g_attestationManager.setSeenAttestations.count(attHash))
+                    return true;
+
+                if (g_attestationManager.IsAttesterBanned(att.attesterOutpoint)) {
+                    LogPrint("attestation", "fluxattest: attester %s is banned\n",
+                             att.attesterOutpoint.ToString());
+                    return true;
+                }
+
+                if (!g_attestationManager.CheckAttesterRateLimit(att.attesterOutpoint, nCurrentHeight)) {
+                    LogPrint("attestation", "fluxattest: attester %s exceeded rate limit\n",
+                             att.attesterOutpoint.ToString());
+                    return true;
+                }
+
+                g_attestationManager.setSeenAttestations.insert(attHash);
+                g_attestationManager.AddAttestation(att.txid, att.attesterOutpoint,
+                                                    att.vchSig, nCurrentHeight);
+                fAccepted = true;
+
+                LogPrint("attestation", "Accepted attestation from %s for tx %s\n",
+                         att.attesterOutpoint.ToString(), att.txid.ToString());
+
+                TryPromoteStagedTx(att.txid, vTxToRelay);
+            }
+            // g_attestationManager.cs released
+        }
+        // cs_main released
+
+        if (fAccepted) {
+            // Relay promoted txs (acquires cs_vNodes internally)
+            for (const CTransaction& txToRelay : vTxToRelay) {
+                RelayTransaction(txToRelay);
+            }
+
+            // Store attestation in mapRelay for getdata
+            {
+                LOCK(cs_mapRelay);
+                CInv relayInv(MSG_FLUXNODE_ATTESTATION, attHash);
+                CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+                ss << att;
+                mapRelay.insert(std::make_pair(relayInv, ss));
+                vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, relayInv));
+            }
+            // Relay attestation inv to peers
+            {
+                LOCK(cs_vNodes);
+                for (CNode* pnode : vNodes) {
+                    if (pnode->GetId() != pfrom->GetId())
+                        pnode->PushInventory(inv);
+                }
+            }
+        }
+    }
+
 
     else if (strCommand == "headers" && !fImporting && !fReindex) // Ignore headers received while importing
     {

@@ -26,7 +26,8 @@ static const char* ppszTypeName[] =
     "zn announce",
     "zn ping",
     "dstx",
-    "cmpct block"
+    "cmpct block",
+    "fluxattest"
 };
 
 CMessageHeader::CMessageHeader(const MessageStartChars& pchMessageStartIn)

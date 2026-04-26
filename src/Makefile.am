@@ -230,6 +230,7 @@ BITCOIN_CORE_H = \
   wallet/wallet_ismine.h \
   wallet/walletdb.h \
   fluxnode/activefluxnode.h \
+  fluxnode/attestation.h \
   fluxnode/benchmarks.h \
   fluxnode/obfuscation.h \
   fluxnode/fluxnode.h \
@@ -297,6 +298,7 @@ libbitcoin_server_a_SOURCES = \
   txmempool.cpp \
   validationinterface.cpp \
   fluxnode/activefluxnode.cpp \
+  fluxnode/attestation.cpp \
   fluxnode/benchmarks.cpp \
   fluxnode/obfuscation.cpp \
   fluxnode/fluxnode.cpp \

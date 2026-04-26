@@ -14,6 +14,9 @@
 #include "addrman.h"
 #include "chainparams.h"
 #include "clientversion.h"
+#include "consensus/upgrades.h"
+#include "fluxnode/attestation.h"
+#include "fluxnode/fluxnode.h"
 #include "primitives/transaction.h"
 #include "scheduler.h"
 #include "ui_interface.h"
@@ -1507,6 +1510,64 @@ void ThreadOpenConnections()
             LogPrintf("Trying anchor connection to %s\n", addr.ToString());
             OpenNetworkConnection(addr, &grant);
             continue;
+        }
+
+        // Reserve 2 outbound slots for confirmed fluxnode peers when attestation is active.
+        // This ensures the node always has fluxnode peers available to generate attestations.
+        if (fFluxnode) {
+            int nHeight = chainActive.Height();
+            bool fAttestationActive = NetworkUpgradeActive(
+                nHeight, Params().GetConsensus(), Consensus::UPGRADE_IP_ATTESTATION);
+            if (fAttestationActive) {
+                int nFluxnodePeers = 0;
+                std::set<std::string> setConnectedFluxnodeIPs;
+                {
+                    LOCK(cs_vNodes);
+                    LOCK(g_fluxnodeCache.cs);
+                    for (CNode* pnode : vNodes) {
+                        if (pnode->fInbound || !pnode->addr.IsRoutable() || pnode->addr.IsTor())
+                            continue;
+                        std::string peerHost = pnode->addr.ToStringIP();
+                        for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+                            std::string entryHost;
+                            int entryPort;
+                            SplitHostPort(data.ip, entryPort, entryHost);
+                            if (entryHost == peerHost) {
+                                nFluxnodePeers++;
+                                setConnectedFluxnodeIPs.insert(peerHost);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (nFluxnodePeers < 2) {
+                    // Pick a random confirmed fluxnode to connect to
+                    LOCK(g_fluxnodeCache.cs);
+                    std::vector<CAddress> vCandidates;
+                    for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+                        std::string entryHost;
+                        int entryPort;
+                        SplitHostPort(data.ip, entryPort, entryHost);
+                        if (setConnectedFluxnodeIPs.count(entryHost))
+                            continue;
+                        CNetAddr netAddr(entryHost, false);
+                        if (!netAddr.IsValid() || !netAddr.IsRoutable() || netAddr.IsTor())
+                            continue;
+                        CService service(netAddr, Params().GetDefaultPort());
+                        vCandidates.push_back(CAddress(service));
+                    }
+                    if (!vCandidates.empty()) {
+                        std::shuffle(vCandidates.begin(), vCandidates.end(),
+                                     std::mt19937(std::random_device()()));
+                        CAddress addrFluxnode = vCandidates.front();
+                        LogPrint("attestation", "Connecting to fluxnode peer %s (have %d fluxnode peers)\n",
+                                 addrFluxnode.ToString(), nFluxnodePeers);
+                        OpenNetworkConnection(addrFluxnode, &grant);
+                        continue;
+                    }
+                }
+            }
         }
 
         //

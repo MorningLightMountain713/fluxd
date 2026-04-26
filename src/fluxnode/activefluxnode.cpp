@@ -7,33 +7,51 @@
 
 #include "activefluxnode.h"
 #include "addrman.h"
+#include "fluxnode/attestation.h"
 #include "fluxnode/fluxnode.h"
 #include "fluxnode/fluxnodeconfig.h"
 #include "protocol.h"
 
+#include "consensus/upgrades.h"
 #include "key_io.h"
+#include "netbase.h"
 #include "fluxnode/benchmarks.h"
 
 
+static int CountClearnetFluxnodePeers()
+{
+    int nCount = 0;
+    LOCK(cs_vNodes);
+    LOCK(g_fluxnodeCache.cs);
+    for (CNode* pnode : vNodes) {
+        if (!pnode->addr.IsRoutable() || pnode->addr.IsTor())
+            continue;
+        std::string peerHost = pnode->addr.ToStringIP();
+        for (const auto& [outpoint, data] : g_fluxnodeCache.mapConfirmedFluxnodeData) {
+            std::string entryHost;
+            int entryPort;
+            SplitHostPort(data.ip, entryPort, entryHost);
+            if (entryHost == peerHost) {
+                nCount++;
+                break;
+            }
+        }
+    }
+    return nCount;
+}
+
 void ActiveFluxnode::ManageDeterministricFluxnode()
 {
-    // We only want to run this command on the VPS that has fluxnode=1 and is running fluxbenchd
     if (!fFluxnode)
         return;
 
     std::string errorMessage;
 
-    // Start confirm transaction
     CMutableTransaction mutTx;
 
-    // Get the current height
     int nHeight = chainActive.Height();
 
-    // Check if fluxnode is currently in the start list, if so we will be building the Initial Confirm Transaction
-    // If the fluxnode is already confirmed check to see if it needs to be re confirmed, if so, Create the Update Transaction
     if (g_fluxnodeCache.InStartTracker(activeFluxnode.deterministicOutPoint)) {
-        // Check if we currently have a tx with the same vin in our mempool
-        // If we do, Resend the wallet transactions to our peers
         if (mempool.mapFluxnodeTxMempool.count(activeFluxnode.deterministicOutPoint)) {
             if (pwalletMain)
                 pwalletMain->ResendWalletTransactions(GetAdjustedTime());
@@ -41,8 +59,20 @@ void ActiveFluxnode::ManageDeterministricFluxnode()
             return;
         }
 
-        // If we don't have one in our mempool. That means it is time to confirm the fluxnode
-        if (nHeight - nLastTriedToConfirm > 3) { // Only try this every couple blocks
+        if (nHeight - nLastTriedToConfirm > 3) {
+            // Check attestation peer readiness before building INITIAL_CONFIRM
+            bool fAttestationActive = NetworkUpgradeActive(
+                nHeight, Params().GetConsensus(), Consensus::UPGRADE_IP_ATTESTATION);
+            if (fAttestationActive) {
+                int nClearnetPeers = CountClearnetFluxnodePeers();
+                int nRequired = GetMinClearnetFluxnodePeers();
+                if (nClearnetPeers < nRequired) {
+                    LogPrintf("Fluxnode: waiting for %d clearnet fluxnode peers (have %d) before INITIAL_CONFIRM\n",
+                              nRequired, nClearnetPeers);
+                    return;
+                }
+            }
+
             activeFluxnode.BuildDeterministicConfirmTx(mutTx, FluxnodeUpdateType::INITIAL_CONFIRM);
             LogPrintf("Fluxnode found in start tracker. Creating Initial Confirm Transactions %s\n", activeFluxnode.deterministicOutPoint.ToString());
         } else {

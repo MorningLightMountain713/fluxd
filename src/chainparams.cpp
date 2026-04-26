@@ -151,7 +151,11 @@ public:
 
         consensus.vUpgrades[Consensus::UPGRADE_PON].nProtocolVersion = 170020;
         consensus.vUpgrades[Consensus::UPGRADE_PON].nActivationHeight = 2020000;
-        
+
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nProtocolVersion = 170022;
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nActivationHeight =
+                Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+
         // PON subsidy parameters
         consensus.nPONInitialSubsidy = 14;  // 14 FLUX per block initially
         consensus.nPONSubsidyReductionInterval = 1051200;  // ~1 year in 30-second blocks (365*24*60*2)
@@ -392,7 +396,10 @@ public:
 
         consensus.vUpgrades[Consensus::UPGRADE_PON].nProtocolVersion = 170020;
         consensus.vUpgrades[Consensus::UPGRADE_PON].nActivationHeight = 800;
-        
+
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nProtocolVersion = 170022;
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nActivationHeight = 1000;
+
         // PON subsidy parameters (testnet)
         consensus.nPONInitialSubsidy = 14;  // 14 FLUX per block initially
         consensus.nPONSubsidyReductionInterval = 525600;  // ~6 months for testnet (365/2*24*60*2)
@@ -609,7 +616,11 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_PON].nProtocolVersion = 170020;
         consensus.vUpgrades[Consensus::UPGRADE_PON].nActivationHeight =
                 Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
-        
+
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nProtocolVersion = 170022;
+        consensus.vUpgrades[Consensus::UPGRADE_IP_ATTESTATION].nActivationHeight =
+                Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+
         // PON subsidy parameters (regtest)
         consensus.nPONInitialSubsidy = 14;  // 14 FLUX per block initially
         consensus.nPONSubsidyReductionInterval = 100;  // Quick reduction for testing

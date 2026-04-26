@@ -167,6 +167,7 @@ enum {
     // Diverges from Bitcoin Core's MSG_CMPCT_BLOCK=4 because type 4 is
     // already used as "spork" on the Flux network.
     MSG_CMPCT_BLOCK = 11,
+    MSG_FLUXNODE_ATTESTATION = 12,
 };
 
 #endif // BITCOIN_PROTOCOL_H

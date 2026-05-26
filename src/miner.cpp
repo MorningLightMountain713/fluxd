@@ -571,6 +571,7 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
         }
 
         CValidationState state;
+        int64_t nTestStart = GetTimeMicros();
         if (!TestBlockValidity(state, chainparams, *pblock, pindexPrev, false, false, false)) {
             if (state.IsInvalidTx()) {
                 LogPrintf("Removing transaction from mempool that is causing block to fail validity check. %s\n", state.GetInvalidTx().GetHash().GetHex());
@@ -578,6 +579,11 @@ CBlockTemplate* CreateNewBlock(const CChainParams& chainparams, const CScript& s
                 mempool.remove(state.GetInvalidTx(), removed, false);
             }
             throw std::runtime_error(strprintf("CreateNewBlock(): TestBlockValidity failed: %s", state.GetRejectReason()));
+        }
+        int64_t nTestMs = (GetTimeMicros() - nTestStart) / 1000;
+        if (nTestMs > 5000) {
+            LogPrintf("STALL: TestBlockValidity took %dms (height=%d, txs=%u)\n",
+                      nTestMs, pindexPrev->nHeight + 1, pblock->vtx.size());
         }
     }
 

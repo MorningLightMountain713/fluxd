@@ -4357,7 +4357,9 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
         if (!CheckDiskSpace(0))
             return state.Error("out of disk space");
         // First make sure all block and undo data is flushed to disk.
+        int64_t nFlushStart = GetTimeMicros();
         FlushBlockFile();
+        int64_t nFlushBlockDone = GetTimeMicros();
 
         // Then update all block file information (which may refer to block and undo files).
         {
@@ -4378,6 +4380,8 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
                 return AbortNode(state, "Files to write to block index database");
             }
         }
+        int64_t nWriteBatchDone = GetTimeMicros();
+
         // Finally remove any pruned files
         if (fFlushForPrune)
             UnlinkPrunedFiles(setFilesToPrune);
@@ -4385,6 +4389,13 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
         // Randomize next write interval to prevent thundering herd
         int64_t range = DATABASE_WRITE_INTERVAL_MAX - DATABASE_WRITE_INTERVAL_MIN;
         nNextWriteInterval = DATABASE_WRITE_INTERVAL_MIN + (GetRand(range + 1));
+
+        int64_t nFlushBlockMs = (nFlushBlockDone - nFlushStart) / 1000;
+        int64_t nWriteBatchMs = (nWriteBatchDone - nFlushBlockDone) / 1000;
+        if (nFlushBlockMs > 5000 || nWriteBatchMs > 5000) {
+            LogPrintf("FLUSH STALL: FlushBlockFile=%dms WriteBatchSync=%dms (mode=%d)\n",
+                      nFlushBlockMs, nWriteBatchMs, mode);
+        }
     }
     // Flush best chain related state. This can only be done if the blocks / block index write was also done.
     if (fDoFullFlush) {
@@ -4396,8 +4407,10 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
         if (!CheckDiskSpace(128 * 2 * 2 * pcoinsTip->GetCacheSize()))
             return state.Error("out of disk space");
         // Flush the chainstate (which may refer to block index entries).
+        int64_t nCoinFlushStart = GetTimeMicros();
         if (!pcoinsTip->Flush())
             return AbortNode(state, "Failed to write to coin database");
+        int64_t nCoinFlushDone = GetTimeMicros();
 
         // Dump Fluxnode cache to database with sync state marker
         // This uses atomic batch writes to ensure consistency between
@@ -4407,7 +4420,15 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode) {
         } else {
             g_fluxnodeCache.DumpFluxnodeCache();
         }
+        int64_t nDumpCacheDone = GetTimeMicros();
         nLastFlush = nNow;
+
+        int64_t nCoinFlushMs = (nCoinFlushDone - nCoinFlushStart) / 1000;
+        int64_t nDumpCacheMs = (nDumpCacheDone - nCoinFlushDone) / 1000;
+        if (nCoinFlushMs > 5000 || nDumpCacheMs > 5000) {
+            LogPrintf("FLUSH STALL: pcoinsTip->Flush=%dms DumpFluxnodeCache=%dms\n",
+                      nCoinFlushMs, nDumpCacheMs);
+        }
     }
     if ((mode == FLUSH_STATE_ALWAYS || mode == FLUSH_STATE_PERIODIC) && nNow > nLastSetChain + nNextWriteInterval * 1000000) {
         // Update best block in wallet (so we can detect restored wallets).
@@ -4702,9 +4723,14 @@ bool static ConnectTip(CValidationState& state, const CChainParams& chainparams,
             static int cleanupCounter = 0;
             cleanupCounter++;
             if (cleanupCounter >= 10 && (std::rand() % 10 == 0)) {
+                int64_t nCleanStart = GetTimeMicros();
                 LogPrintf("Cleaning up fluxnode undo data from database\n");
                 pFluxnodeDB->CleanupOldFluxnodeData();
                 cleanupCounter = 0; // Reset counter
+                int64_t nCleanMs = (GetTimeMicros() - nCleanStart) / 1000;
+                if (nCleanMs > 5000) {
+                    LogPrintf("STALL: CleanupOldFluxnodeData took %dms\n", nCleanMs);
+                }
             }
 
             // This triggers a data compact command around every day.
@@ -4713,9 +4739,14 @@ bool static ConnectTip(CValidationState& state, const CChainParams& chainparams,
             static int compactCounter = 0;
             compactCounter++;
             if (compactCounter >= 720 && (std::rand() % 10 == 0)) {
+                int64_t nCompactStart = GetTimeMicros();
                 LogPrintf("Compacting Fluxnode database\n");
                 pFluxnodeDB->CompactDatabase();
                 compactCounter = 0; // Reset counter
+                int64_t nCompactMs = (GetTimeMicros() - nCompactStart) / 1000;
+                if (nCompactMs > 5000) {
+                    LogPrintf("STALL: CompactDatabase took %dms\n", nCompactMs);
+                }
             }
         }
     }
@@ -4961,8 +4992,13 @@ bool ActivateBestChain(CValidationState& state, const CChainParams& chainparams,
     CheckBlockIndex(chainparams.GetConsensus());
 
     // Write changes periodically to disk, after relay.
+    int64_t nFlushStart = GetTimeMicros();
     if (!FlushStateToDisk(state, FLUSH_STATE_PERIODIC)) {
         return false;
+    }
+    int64_t nFlushMs = (GetTimeMicros() - nFlushStart) / 1000;
+    if (nFlushMs > 5000) {
+        LogPrintf("STALL: ActivateBestChain periodic flush took %dms\n", nFlushMs);
     }
 
     return true;
